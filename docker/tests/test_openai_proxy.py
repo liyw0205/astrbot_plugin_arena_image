@@ -64,6 +64,7 @@ class OpenAIProxyTest(AioHTTPTestCase):
     async def get_application(self):
         self.plugin = FakePlugin()
         server = OpenAIProxyServer(self.plugin)
+        self.proxy = server
         server._web = __import__("aiohttp.web", fromlist=["web"])
         app = server._web.Application()
         app.router.add_get("/v1/models", server._handle_models)
@@ -107,9 +108,13 @@ class OpenAIProxyTest(AioHTTPTestCase):
     @unittest_run_loop
     async def test_renamed_mona_model_alias_resolves_to_luna(self):
         self.plugin._fetch_models = lambda: _models_with_luna()
-        server = OpenAIProxyServer(self.plugin)
-        server._web = __import__("aiohttp.web", fromlist=["web"])
-        self.assertEqual(await server._resolve_model("mona-lisa-alpha"), "luna-lisa-alpha")
+        self.proxy._web = __import__("aiohttp.web", fromlist=["web"])
+        self.assertEqual(await self.proxy._resolve_model("mona-lisa-alpha"), "luna-lisa-alpha")
+        response = await self.client.get(
+            "/v1/models", headers={"Authorization": "Bearer test-key"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual([item["id"] for item in (await response.json())["data"]], ["luna-lisa-alpha"])
 
     @unittest_run_loop
     async def test_multipart_edit(self):

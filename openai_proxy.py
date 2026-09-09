@@ -186,13 +186,6 @@ class OpenAIProxyServer:
                         "output_image": bool(model.get("output_image", True)),
                     }
                 )
-                canonical = model_id.casefold()
-                for alias, target in MODEL_ALIASES.items():
-                    if canonical == target.casefold():
-                        alias_entry = dict(data[-1])
-                        alias_entry["id"] = alias
-                        alias_entry["alias_for"] = model_id
-                        data.append(alias_entry)
             return self._json({"object": "list", "data": data})
         except Exception as exc:
             return self._error_response(exc)
