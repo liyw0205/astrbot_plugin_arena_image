@@ -687,10 +687,14 @@ class CDPWebSocket:
         port = parts.port or (443 if parts.scheme == "wss" else 80)
         path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
 
-        # A proxy that forwards /json/version verbatim reports Chrome's own
-        # loopback address; the configured endpoint is the reachable one.
+        # The CDP proxy may return Chrome's internal/container hostname in the
+        # WebSocket URL (for example ``arena-browser``), even when AstrBot is
+        # running on the host and reached the proxy via ``127.0.0.1``.  Always
+        # prefer the configured endpoint's host when the reported host differs;
+        # otherwise the initial HTTP probe succeeds but the WebSocket connect
+        # fails with a misleading "CDP connection failed" error.
         endpoint_parts = urlsplit(self.endpoint)
-        if host in {"127.0.0.1", "localhost"} and endpoint_parts.hostname:
+        if endpoint_parts.hostname and host != endpoint_parts.hostname:
             host = endpoint_parts.hostname
             port = endpoint_parts.port or port
 

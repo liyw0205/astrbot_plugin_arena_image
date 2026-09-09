@@ -36,6 +36,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    "cryptography",
     "black",
     "isort",
     "ruff",

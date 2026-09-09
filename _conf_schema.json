@@ -16,6 +16,27 @@
     "secret": true,
     "default": ""
   },
+  "openai_proxy_enabled": {
+    "type": "bool",
+    "description": "开启 OpenAI 兼容图像中转接口（/v1/models、/v1/images/generations、/v1/images/edits）",
+    "default": false
+  },
+  "openai_proxy_host": {
+    "type": "string",
+    "description": "OpenAI 中转监听地址；默认 127.0.0.1 仅本机可访问，需要给其它机器使用时填 0.0.0.0 并配置 API Key",
+    "default": "127.0.0.1"
+  },
+  "openai_proxy_port": {
+    "type": "int",
+    "description": "OpenAI 中转监听端口",
+    "default": 18081
+  },
+  "openai_proxy_api_key": {
+    "type": "string",
+    "description": "OpenAI 中转 API Key；监听非本机地址时必填，客户端使用 Authorization: Bearer 该值",
+    "secret": true,
+    "default": ""
+  },
   "browser_cdp_url": {
     "type": "string",
     "description": "arena-browser 的 CDP 地址（仅 direct 模式）。一般不用改；只有 AstrBot 和浏览器不在同一个 Docker 网络、且自动改试 host.docker.internal / 172.17.0.1 / 127.0.0.1 都连不上时，才填 http://服务器IP:9223",

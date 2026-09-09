@@ -307,6 +307,10 @@ transport_mode: bridge  →  direct
 | `transport_mode` | `bridge` | `bridge` = 走 arena-bridge 容器；`direct` = 插件直连 arena-browser，不需要 bridge |
 | `bridge_url` | `http://arena-bridge:8000` | Bridge 根地址或 `/api/v1` 地址（bridge 模式） |
 | `bridge_api_key` | 空 | Bridge API Key，零配置部署留空 |
+| `openai_proxy_enabled` | 关闭 | 开启 OpenAI 兼容图像中转接口 |
+| `openai_proxy_host` | `127.0.0.1` | 中转监听地址；要让其它机器访问填 `0.0.0.0`，并配置 API Key |
+| `openai_proxy_port` | `18081` | 中转监听端口 |
+| `openai_proxy_api_key` | 空 | 中转 API Key；客户端用 `Authorization: Bearer` 传递，监听非本机地址时必填 |
 | `browser_cdp_url` | `http://arena-browser:9223` | 浏览器 CDP 地址（direct 模式，一般不用改；连不上时自动改试 `host.docker.internal`／`172.17.0.1`／`127.0.0.1`，配合 `.env` 的 `ARENA_CDP_BIND=172.17.0.1` 可跨 Docker 网络） |
 | `browser_gateway_url` | 空 | 验证链接网关；留空时插件读 `arena-browser-data/gateway-url.txt`（`setup.sh` 写入），老部署才需要手填 `http://服务器IP:6081`（端口 = 宿主机上映射到浏览器 6081 的那个，改过就填改过的，如 `:7081`；面板上这一栏显示的是「验证链接网关地址」） |
 | `interactive_link_secret` | 空 | 留空即可：插件通过 CDP 读浏览器里的 `/run/secrets/interactive_link_secret`，和网关校验用的是同一个文件 |
@@ -332,6 +336,46 @@ transport_mode: bridge  →  direct
 - 模型选择是全局的：`/竞技场切换模型` 一次，所有群聊和私聊都跟着换
 - 预设提示词保存在插件数据目录的 `prompt_presets.json`，更新插件不会丢
 - Pillow 是 AstrBot 自带的，缺失时只会跳过压缩，不影响画图
+
+### OpenAI 兼容中转
+
+打开 `openai_proxy_enabled` 后，插件会在 AstrBot 进程内监听一个轻量 HTTP 服务，
+把请求转给当前配置的 Arena Bridge 或服务器浏览器。默认只监听本机，适合给同一台机器上的
+OpenAI 客户端使用；需要跨机器访问时，将 `openai_proxy_host` 改为 `0.0.0.0`，设置强随机
+的 `openai_proxy_api_key`，并在防火墙只放行可信来源。
+
+接口如下：
+
+```text
+GET  /v1/models
+POST /v1/images/generations   # JSON: {"model":"...", "prompt":"...", "n":1}
+POST /v1/images/edits         # multipart: model、prompt、image（可重复）
+```
+
+图像接口返回 OpenAI 风格的 `data[].b64_json`，因此不依赖 Arena 的临时图片 URL 对外可达。
+客户端的 Base URL 填 `http://服务器地址:18081/v1`，API Key 填插件中的中转 Key。例如：
+
+如果 AstrBot 本身运行在 Docker 里，还需要在 AstrBot 的 compose 配置中增加
+`18081:18081` 端口映射；插件配置里的监听地址填 `0.0.0.0` 后，才可以从宿主机或其它机器访问。
+公网部署请同时配置强随机 API Key 和防火墙白名单。
+
+```bash
+curl http://127.0.0.1:18081/v1/models
+curl http://127.0.0.1:18081/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-image-2 (medium)","prompt":"a red panda in watercolor"}'
+```
+
+`/v1/images/edits` 同时接受标准 `multipart/form-data` 上传和 JSON 图片 Data URI；`n` 的上限
+受 `max_output_images` 控制，默认一次返回一张图。
+
+API 和聊天出图共用 `max_queue_depth` 排队上限；队列满时 API 返回 HTTP 429。
+上传会检查整个请求体（包括 chunked 请求和未使用的表单字段），multipart 文本字段最多
+1 MiB，单张参考图仍受 `max_image_bytes` 限制；超过上传上限返回 HTTP 413。
+
+浏览器的认证代理同时支持 HTTP 和 HTTPS 上游；HTTPS 会先验证代理服务器证书再发送认证信息。
+常规代理保留原始 Google CONNECT 目标；仅在上游代理确实存在 Google reCAPTCHA/OAuth
+兼容问题时，才在 `docker/.env` 设置 `LM_BRIDGE_PROXY_GOOGLE_WORKAROUNDS=1` 并重建浏览器容器。
 
 ## 更新插件
 
