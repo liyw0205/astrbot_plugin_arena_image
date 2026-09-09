@@ -29,6 +29,46 @@ from .bridge_client import (
 # before the rename, but only expose/use the alias while the canonical model is
 # actually present in the live model table.
 MODEL_ALIASES = {"mona-lisa-alpha": "luna-lisa-alpha"}
+MAX_FORM_TEXT_BYTES = 1 << 20
+
+
+class _LimitedMultipartPayload:
+    """Count the entire multipart stream, including skipped fields and headers.
+
+    aiohttp enforces client_max_size in request.read()/json(), not in
+    request.multipart(). Count at the reader boundary so chunked uploads and
+    fields skipped by MultipartReader.release() obey the same request limit.
+    """
+
+    def __init__(self, stream: Any, limit: int, web: Any) -> None:
+        self.stream = stream
+        self.limit = limit
+        self.web = web
+        self.consumed = 0
+
+    def _count(self, data: bytes) -> bytes:
+        self.consumed += len(data)
+        if self.consumed > self.limit:
+            raise self.web.HTTPRequestEntityTooLarge(
+                max_size=self.limit, actual_size=self.consumed
+            )
+        return data
+
+    async def read(self, size: int = -1) -> bytes:
+        remaining = max(1, self.limit - self.consumed + 1)
+        size = remaining if size < 0 else min(size, remaining)
+        return self._count(await self.stream.read(size))
+
+    async def readline(self) -> bytes:
+        return self._count(await self.stream.readline())
+
+    def unread_data(self, data: bytes) -> None:
+        # MultipartReader looks ahead past a boundary and pushes bytes back.
+        self.consumed -= len(data)
+        self.stream.unread_data(data)
+
+    def at_eof(self) -> bool:
+        return self.stream.at_eof()
 
 
 class OpenAIProxyServer:
@@ -53,7 +93,9 @@ class OpenAIProxyServer:
             return
         try:
             from aiohttp import web
-        except ImportError as exc:  # pragma: no cover - dependency is installed in production
+        except (
+            ImportError
+        ) as exc:  # pragma: no cover - dependency is installed in production
             raise RuntimeError("启用 OpenAI 中转需要安装 aiohttp") from exc
 
         self._web = web
@@ -97,7 +139,12 @@ class OpenAIProxyServer:
 
     def _enabled(self) -> bool:
         value = self.plugin.config.get("openai_proxy_enabled", False)
-        return value is True or str(value).strip().casefold() in {"1", "true", "yes", "on"}
+        return value is True or str(value).strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def _port_value(self) -> int:
         try:
@@ -110,7 +157,9 @@ class OpenAIProxyServer:
         return str(self.plugin.config.get("openai_proxy_api_key") or "").strip()
 
     def _is_loopback_host(self) -> bool:
-        return str(self.plugin.config.get("openai_proxy_host") or "127.0.0.1").strip().casefold() in {
+        return str(
+            self.plugin.config.get("openai_proxy_host") or "127.0.0.1"
+        ).strip().casefold() in {
             "127.0.0.1",
             "localhost",
             "::1",
@@ -152,7 +201,9 @@ class OpenAIProxyServer:
             supplied = supplied[7:].strip()
         if not supplied:
             supplied = request.headers.get("X-API-Key", "").strip()
-        if not secrets.compare_digest(supplied, configured):
+        if not secrets.compare_digest(
+            supplied.encode("utf-8"), configured.encode("utf-8")
+        ):
             return self._auth_error()
         return None
 
@@ -180,7 +231,9 @@ class OpenAIProxyServer:
                         "object": "model",
                         "created": created or int(time.time()),
                         "owned_by": str(
-                            model.get("owned_by") or model.get("organization") or "arena"
+                            model.get("owned_by")
+                            or model.get("organization")
+                            or "arena"
                         ),
                         "input_image": bool(model.get("input_image")),
                         "output_image": bool(model.get("output_image", True)),
@@ -229,7 +282,9 @@ class OpenAIProxyServer:
             raise ValueError("请求体必须是 JSON 对象")
         return payload
 
-    async def _parse_edit_request(self, request: Any) -> tuple[str, str, int, list[str]]:
+    async def _parse_edit_request(
+        self, request: Any
+    ) -> tuple[str, str, int, list[str]]:
         if str(request.content_type or "").casefold() == "application/json":
             body = await self._json_body(request)
             prompt = str(body.get("prompt") or "").strip()
@@ -243,7 +298,16 @@ class OpenAIProxyServer:
 
         if not str(request.content_type or "").startswith("multipart/"):
             raise ValueError("图生图接口需要 multipart/form-data 或 JSON")
-        reader = await request.multipart()
+        from aiohttp import BodyPartReader, MultipartReader
+
+        limit = request.client_max_size
+        if request.content_length is not None and request.content_length > limit:
+            raise self._web.HTTPRequestEntityTooLarge(
+                max_size=limit, actual_size=request.content_length
+            )
+        reader = MultipartReader(
+            request.headers, _LimitedMultipartPayload(request.content, limit, self._web)
+        )
         prompt = ""
         model = ""
         count_value: Any = 1
@@ -253,9 +317,12 @@ class OpenAIProxyServer:
             part = await reader.next()
             if part is None:
                 break
+            if not isinstance(part, BodyPartReader):
+                raise ValueError("不支持嵌套 multipart 上传")
             name = str(part.name or "").casefold()
             if name in {"prompt", "model", "n"}:
-                value = (await part.text()).strip()
+                raw = await self._read_part(part, MAX_FORM_TEXT_BYTES)
+                value = raw.decode(part.get_charset(default="utf-8")).strip()
                 if name == "prompt":
                     prompt = value
                 elif name == "model":
@@ -294,6 +361,8 @@ class OpenAIProxyServer:
         return max(1, min(8, value))
 
     def _normalize_images(self, values: list[Any]) -> list[str]:
+        if not isinstance(values, list):
+            raise ValueError("images 必须是图片字符串数组")
         if len(values) > self._max_input_images():
             raise ValueError(f"最多只能上传 {self._max_input_images()} 张图片")
         normalized: list[str] = []
@@ -314,8 +383,17 @@ class OpenAIProxyServer:
             )
         return normalized
 
-    @staticmethod
-    async def _read_part(part: Any, max_bytes: int) -> bytes:
+    async def _read_part(self, part: Any, max_bytes: int) -> bytes:
+        if part.headers.get("Content-Encoding", "").lower() not in {"", "identity"}:
+            raise ValueError("multipart 字段请使用未压缩的数据")
+        if part.headers.get("Content-Transfer-Encoding", "").lower() not in {
+            "",
+            "binary",
+            "8bit",
+        }:
+            raise ValueError(
+                "multipart 字段请使用原始数据；Base64 图片请通过 JSON 提交"
+            )
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -324,7 +402,9 @@ class OpenAIProxyServer:
                 break
             total += len(chunk)
             if total > max_bytes:
-                raise ValueError(f"图片超过大小限制（{max_bytes // 1024 // 1024} MB）")
+                raise self._web.HTTPRequestEntityTooLarge(
+                    max_size=max_bytes, actual_size=total
+                )
             chunks.append(chunk)
         return b"".join(chunks)
 
@@ -333,7 +413,9 @@ class OpenAIProxyServer:
             requested = int(value or 1)
         except (TypeError, ValueError) as exc:
             raise ValueError("n must be an integer") from exc
-        maximum = max(1, min(4, int(self.plugin.config.get("max_output_images", 1) or 1)))
+        maximum = max(
+            1, min(4, int(self.plugin.config.get("max_output_images", 1) or 1))
+        )
         if requested < 1 or requested > maximum:
             raise ValueError(f"n must be between 1 and {maximum}")
         return requested
@@ -343,8 +425,11 @@ class OpenAIProxyServer:
         if not models:
             raise BridgeError("没有可用的画图模型")
         wanted = str(requested or "").strip().casefold()
-        by_id = {self.plugin._model_id(model).casefold(): self.plugin._model_id(model) for model in models}
-        if wanted in MODEL_ALIASES:
+        by_id = {
+            self.plugin._model_id(model).casefold(): self.plugin._model_id(model)
+            for model in models
+        }
+        if wanted not in by_id and MODEL_ALIASES.get(wanted) in by_id:
             wanted = MODEL_ALIASES[wanted].casefold()
         if wanted:
             if wanted not in by_id:
@@ -365,43 +450,69 @@ class OpenAIProxyServer:
         count: int,
     ) -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
-        async with self.plugin._generation_lock:
-            while len(result) < count:
-                response = await self.plugin._client().complete(
-                    model=model,
-                    prompt=prompt,
-                    images=images or None,
-                )
-                candidates = image_urls(response)
-                if not candidates:
-                    text = response_text(response).strip()
-                    raise BridgeError(text or "模型没有返回图片")
-                for candidate in candidates:
-                    path = await self.plugin._materialize_output(candidate)
-                    raw = path.read_bytes()
-                    result.append(
-                        {
-                            "b64_json": base64.b64encode(raw).decode("ascii"),
-                            "mime_type": guess_image_mime(path.name, raw),
-                        }
+        try:
+            maximum = int(self.plugin.config.get("max_queue_depth", 5))
+        except (TypeError, ValueError):
+            maximum = 5
+        maximum = max(1, min(50, maximum))
+        if self.plugin._active_generations >= maximum:
+            raise BridgeError("生成队列已满，请稍后重试", status_code=429)
+        # No await between admission and increment: this is the same counter
+        # the existing chat path uses, so neither entry point bypasses the cap.
+        self.plugin._active_generations += 1
+        try:
+            async with self.plugin._generation_lock:
+                started_at = time.monotonic()
+                while len(result) < count:
+                    response = await self.plugin._client().complete(
+                        model=model,
+                        prompt=prompt,
+                        images=images or None,
                     )
-                    if len(result) >= count:
-                        break
-        self.plugin._prune_outputs()
-        return result
+                    candidates = image_urls(response)
+                    if not candidates:
+                        text = response_text(response).strip()
+                        raise BridgeError(text or "模型没有返回图片")
+                    for candidate in candidates:
+                        path = await self.plugin._materialize_output(candidate)
+                        raw = path.read_bytes()
+                        result.append(
+                            {
+                                "b64_json": base64.b64encode(raw).decode("ascii"),
+                                "mime_type": guess_image_mime(path.name, raw),
+                            }
+                        )
+                        if len(result) >= count:
+                            break
+                self.plugin._last_generation_seconds = time.monotonic() - started_at
+                self.plugin._prune_outputs()
+            return result
+        finally:
+            self.plugin._active_generations = max(
+                0, self.plugin._active_generations - 1
+            )
 
     def _json(self, payload: Any):
         return self._web.json_response(payload, headers=self._cors_headers())
 
     def _bad_request(self, message: str):
         return self._web.json_response(
-            {"error": {"message": message, "type": "invalid_request_error", "code": "bad_request"}},
+            {
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": "bad_request",
+                }
+            },
             status=400,
             headers=self._cors_headers(),
         )
 
     def _error_response(self, exc: Exception):
-        if isinstance(exc, ValueError):
+        if isinstance(exc, self._web.HTTPException):
+            status = exc.status
+            code = "payload_too_large" if status == 413 else "bad_request"
+        elif isinstance(exc, ValueError):
             status = 400
             code = "bad_request"
         elif isinstance(exc, BridgeError) and exc.is_rate_limited:

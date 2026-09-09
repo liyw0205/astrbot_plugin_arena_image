@@ -369,6 +369,14 @@ curl http://127.0.0.1:18081/v1/images/generations \
 `/v1/images/edits` 同时接受标准 `multipart/form-data` 上传和 JSON 图片 Data URI；`n` 的上限
 受 `max_output_images` 控制，默认一次返回一张图。
 
+API 和聊天出图共用 `max_queue_depth` 排队上限；队列满时 API 返回 HTTP 429。
+上传会检查整个请求体（包括 chunked 请求和未使用的表单字段），multipart 文本字段最多
+1 MiB，单张参考图仍受 `max_image_bytes` 限制；超过上传上限返回 HTTP 413。
+
+浏览器的认证代理同时支持 HTTP 和 HTTPS 上游；HTTPS 会先验证代理服务器证书再发送认证信息。
+常规代理保留原始 Google CONNECT 目标；仅在上游代理确实存在 Google reCAPTCHA/OAuth
+兼容问题时，才在 `docker/.env` 设置 `LM_BRIDGE_PROXY_GOOGLE_WORKAROUNDS=1` 并重建浏览器容器。
+
 ## 更新插件
 
 仓库根目录就是插件目录，AstrBot 面板里的插件市场更新和一键更新都能直接用。

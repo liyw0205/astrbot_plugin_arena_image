@@ -5,7 +5,7 @@ import asyncio
 import unittest
 
 from aiohttp import FormData
-from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
+from aiohttp.test_utils import AioHTTPTestCase
 
 from astrbot_plugin_arena_image.openai_proxy import OpenAIProxyServer
 
@@ -31,9 +31,12 @@ class FakePlugin:
     }
 
     def __init__(self):
+        self.config = dict(type(self).config)
         self._selected_models = {}
         self.client = FakeClient()
         self._generation_lock = asyncio.Lock()
+        self._active_generations = 0
+        self._last_generation_seconds = 0.0
 
     async def _fetch_models(self):
         return [{"id": "image-model", "organization": "openai", "output_image": True}]
@@ -72,12 +75,10 @@ class OpenAIProxyTest(AioHTTPTestCase):
         app.router.add_post("/v1/images/edits", server._handle_edits)
         return app
 
-    @unittest_run_loop
     async def test_requires_bearer_key(self):
         response = await self.client.get("/v1/models")
         self.assertEqual(response.status, 401)
 
-    @unittest_run_loop
     async def test_models_generation_and_json_edit(self):
         headers = {"Authorization": "Bearer test-key"}
         response = await self.client.get("/v1/models", headers=headers)
@@ -105,18 +106,16 @@ class OpenAIProxyTest(AioHTTPTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(len((await response.json())["data"]), 1)
 
-    @unittest_run_loop
     async def test_renamed_mona_model_alias_resolves_to_luna(self):
         self.plugin._fetch_models = lambda: _models_with_luna()
         self.proxy._web = __import__("aiohttp.web", fromlist=["web"])
         self.assertEqual(await self.proxy._resolve_model("mona-lisa-alpha"), "luna-lisa-alpha")
-        response = await self.client.get(
-            "/v1/models", headers={"Authorization": "Bearer test-key"}
-        )
+        response = await self.client.get("/v1/models", headers={"Authorization": "Bearer test-key"})
         self.assertEqual(response.status, 200)
-        self.assertEqual([item["id"] for item in (await response.json())["data"]], ["luna-lisa-alpha"])
+        self.assertEqual(
+            [item["id"] for item in (await response.json())["data"]], ["luna-lisa-alpha"]
+        )
 
-    @unittest_run_loop
     async def test_multipart_edit(self):
         form = FormData()
         form.add_field("model", "image-model")
