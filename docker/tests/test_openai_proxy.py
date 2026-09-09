@@ -81,7 +81,8 @@ class OpenAIProxyTest(AioHTTPTestCase):
         headers = {"Authorization": "Bearer test-key"}
         response = await self.client.get("/v1/models", headers=headers)
         self.assertEqual(response.status, 200)
-        self.assertEqual((await response.json())["data"][0]["id"], "image-model")
+        model_ids = [item["id"] for item in (await response.json())["data"]]
+        self.assertIn("image-model", model_ids)
 
         response = await self.client.post(
             "/v1/images/generations",
@@ -104,6 +105,13 @@ class OpenAIProxyTest(AioHTTPTestCase):
         self.assertEqual(len((await response.json())["data"]), 1)
 
     @unittest_run_loop
+    async def test_renamed_mona_model_alias_resolves_to_luna(self):
+        self.plugin._fetch_models = lambda: _models_with_luna()
+        server = OpenAIProxyServer(self.plugin)
+        server._web = __import__("aiohttp.web", fromlist=["web"])
+        self.assertEqual(await server._resolve_model("mona-lisa-alpha"), "luna-lisa-alpha")
+
+    @unittest_run_loop
     async def test_multipart_edit(self):
         form = FormData()
         form.add_field("model", "image-model")
@@ -116,6 +124,10 @@ class OpenAIProxyTest(AioHTTPTestCase):
         )
         self.assertEqual(response.status, 200)
         self.assertTrue((await response.json())["data"][0]["b64_json"])
+
+
+async def _models_with_luna():
+    return [{"id": "luna-lisa-alpha", "organization": "", "output_image": True}]
 
 
 if __name__ == "__main__":

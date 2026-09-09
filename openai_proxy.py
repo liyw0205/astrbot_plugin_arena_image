@@ -24,6 +24,12 @@ from .bridge_client import (
     response_text,
 )
 
+# Arena renamed the gray-test model from ``mona-lisa-alpha`` to
+# ``luna-lisa-alpha``. Keep the old public ID working for clients that saved it
+# before the rename, but only expose/use the alias while the canonical model is
+# actually present in the live model table.
+MODEL_ALIASES = {"mona-lisa-alpha": "luna-lisa-alpha"}
+
 
 class OpenAIProxyServer:
     """Lifecycle-managed aiohttp server for the three OpenAI image endpoints."""
@@ -180,6 +186,13 @@ class OpenAIProxyServer:
                         "output_image": bool(model.get("output_image", True)),
                     }
                 )
+                canonical = model_id.casefold()
+                for alias, target in MODEL_ALIASES.items():
+                    if canonical == target.casefold():
+                        alias_entry = dict(data[-1])
+                        alias_entry["id"] = alias
+                        alias_entry["alias_for"] = model_id
+                        data.append(alias_entry)
             return self._json({"object": "list", "data": data})
         except Exception as exc:
             return self._error_response(exc)
@@ -338,6 +351,8 @@ class OpenAIProxyServer:
             raise BridgeError("没有可用的画图模型")
         wanted = str(requested or "").strip().casefold()
         by_id = {self.plugin._model_id(model).casefold(): self.plugin._model_id(model) for model in models}
+        if wanted in MODEL_ALIASES:
+            wanted = MODEL_ALIASES[wanted].casefold()
         if wanted:
             if wanted not in by_id:
                 raise BridgeError(f"模型不存在：{requested}")
