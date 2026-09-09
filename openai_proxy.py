@@ -53,7 +53,12 @@ class OpenAIProxyServer:
         self._web = web
         host = str(self.plugin.config.get("openai_proxy_host") or "127.0.0.1").strip()
         port = self._port_value()
-        max_body = max(1 << 20, self.plugin._input_max_bytes() + (1 << 20))
+        # JSON Data URIs expand a binary image by roughly 4/3; leave room for
+        # several configured reference images plus multipart/JSON overhead.
+        max_body = max(
+            16 * (1 << 20),
+            self.plugin._input_max_bytes() * self._max_input_images() * 2 + (1 << 20),
+        )
         app = web.Application(client_max_size=max_body)
         for path in ("/v1/models", "/models"):
             app.router.add_get(path, self._handle_models)
@@ -230,7 +235,7 @@ class OpenAIProxyServer:
             images = self._normalize_images(values or [])
             return prompt, model, count, images
 
-        if not request.content_type.startswith("multipart/"):
+        if not str(request.content_type or "").startswith("multipart/"):
             raise ValueError("图生图接口需要 multipart/form-data 或 JSON")
         reader = await request.multipart()
         prompt = ""
@@ -257,14 +262,18 @@ class OpenAIProxyServer:
             raw = await self._read_part(part, max_bytes)
             if not raw:
                 continue
-            data_uri = "data:{mime};base64,{encoded}".format(
-                mime=decode_image_value(
+            try:
+                checked_raw, mime = decode_image_value(
                     raw,
                     source=part.filename or "upload.png",
                     mime_type=part.headers.get("Content-Type"),
                     max_bytes=max_bytes,
-                )[1],
-                encoded=base64.b64encode(raw).decode("ascii"),
+                )
+            except BridgeError as exc:
+                raise ValueError(str(exc)) from exc
+            data_uri = "data:{mime};base64,{encoded}".format(
+                mime=mime,
+                encoded=base64.b64encode(checked_raw).decode("ascii"),
             )
             images.append(data_uri)
             if len(images) > self._max_input_images():
