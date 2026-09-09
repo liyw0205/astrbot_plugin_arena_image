@@ -27,9 +27,19 @@ if [ -z "$CHROME" ]; then
 fi
 PROXY_URL="${LM_BRIDGE_PROXY_URL:-${HTTP_PROXY:-}}"
 proxy_args=()
+CHROME_PROXY_URL="$PROXY_URL"
 if [ -n "$PROXY_URL" ]; then
+  # Chromium does not accept credentials embedded in --proxy-server URLs.
+  # Start a local relay that adds Proxy-Authorization to the upstream proxy.
+  case "$PROXY_URL" in
+    http://*:*@*|https://*:*@*)
+      python3 /app/proxy_relay.py >/tmp/arena-proxy-relay.log 2>&1 &
+      CHROME_PROXY_URL="http://127.0.0.1:18080"
+      sleep 0.2
+      ;;
+  esac
   proxy_args=(
-    --proxy-server="$PROXY_URL"
+    --proxy-server="$CHROME_PROXY_URL"
     --proxy-bypass-list="localhost;127.0.0.1;arena-browser;arena-bridge;172.16.0.0/12;192.168.0.0/16;10.0.0.0/8"
   )
   echo "arena browser proxy enabled: $PROXY_URL" >&2
@@ -43,6 +53,7 @@ run_chrome() {
       --no-default-browser-check \
       --disable-dev-shm-usage \
       --disable-background-networking \
+      --disable-quic \
       --disable-blink-features=AutomationControlled \
       --disable-features=AutomationControlled \
       --lang=zh-CN \

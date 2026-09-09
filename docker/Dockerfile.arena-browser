@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /app
 COPY arena-browser-entrypoint.sh /usr/local/bin/arena-browser-entrypoint.sh
 COPY novnc_gateway.py /app/novnc_gateway.py
+COPY proxy_relay.py /app/proxy_relay.py
 RUN sed -i "s/\r$//" /usr/local/bin/arena-browser-entrypoint.sh \
     && chmod 755 /usr/local/bin/arena-browser-entrypoint.sh
 
