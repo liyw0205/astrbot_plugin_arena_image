@@ -41,6 +41,7 @@ from .bridge_client import (
     model_is_image_capable,
     response_text,
 )
+from .openai_proxy import OpenAIProxyServer
 
 PLUGIN_NAME = "astrbot_plugin_arena_image"
 GLOBAL_SELECTION_KEY = "__global__"
@@ -179,7 +180,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.6.5",
+    "0.7.0",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -207,6 +208,7 @@ class ArenaImagePlugin(Star):
         self._active_generations = 0
         self._last_generation_seconds = 0.0
         self._interactive_auth_session_id = ""
+        self._openai_proxy = OpenAIProxyServer(self)
 
     async def initialize(self):
         if self._transport_mode() == "direct":
@@ -216,9 +218,15 @@ class ArenaImagePlugin(Star):
             )
         else:
             logger.info("[arena_image] 插件已加载，Bridge 地址：%s", self._bridge_url())
+        if self._openai_proxy._enabled():
+            try:
+                await self._openai_proxy.start()
+                logger.info("[arena_image] OpenAI 图像中转已启动：%s", self._openai_proxy.address)
+            except Exception as exc:
+                logger.error("[arena_image] OpenAI 图像中转启动失败：%s", exc)
 
     async def terminate(self):
-        return None
+        await self._openai_proxy.stop()
 
     def _bridge_url(self) -> str:
         return str(self.config.get("bridge_url") or "http://arena-bridge:8000").strip()
