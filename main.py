@@ -180,7 +180,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.1",
+    "0.7.2",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -758,12 +758,106 @@ class ArenaImagePlugin(Star):
             lines.append(f"……其余 {len(chosen) - limit} 个已省略，可调整 model_list_limit。")
         lines.append("用法：/竞技场切换模型 编号或完整模型名（编号两个列表通用，所以不连号）")
         lines.append("状态为最近一次请求结果，非实时探活；上游端点名可能与模型显示名不同。")
+        lines.append("GPT 名称对照（含未开放项）：/竞技场模型名称 GPT")
         lines.append(
             "另一半：/竞技场画图模型（正式模型）"
             if stealth
             else "另一半：/竞技场灰测模型（含蒙娜丽莎）"
         )
         return "\n".join(lines)
+
+    async def _model_name_list_text(self, keyword: str = "GPT") -> str:
+        """Show a read-only name inventory, separate from the numbered picker."""
+        keyword = keyword.strip() or "GPT"
+        client = self._client()
+        reader = getattr(client, "model_name_catalog", None)
+        if callable(reader):
+            payload = await reader()
+            if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+                raise BridgeError("后端未返回有效的模型名称列表")
+            rows = payload["models"]
+            complete = payload.get("complete") is True
+        else:
+            # Older bridge servers expose selectable models only. Do not claim
+            # their filtered list contains the hidden Arena catalog.
+            rows = [
+                {
+                    "id": self._model_id(model),
+                    "display_name": self._model_id(model),
+                    "user_selectable": True,
+                    "selectable": True,
+                }
+                for model in await self._fetch_models(force=True)
+                if model_is_image_capable(model)[0]
+            ]
+            complete = False
+        groups: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            public_name = str(row.get("id") or "").strip()
+            display_name = str(row.get("display_name") or public_name).strip()
+            if not public_name or not display_name:
+                continue
+            group = groups.setdefault(display_name.casefold(), {
+                "name": display_name, "names": set(), "request_names": set(),
+                "selectable_variants": 0, "upstream_selectable_variants": 0,
+            })
+            group["names"].add(public_name)
+            if row.get("user_selectable") is True:
+                group["upstream_selectable_variants"] += 1
+                if row.get("selectable") is True:
+                    group["selectable_variants"] += 1
+                    group["request_names"].add(public_name)
+        needle = keyword.casefold()
+        chosen = [
+            group for group in groups.values()
+            if any(needle in name.casefold() for name in (group["name"], *group["names"]))
+        ]
+        chosen.sort(key=lambda group: (not bool(group["selectable_variants"]), group["name"].casefold()))
+        lines = [f"竞技场模型名称（关键词 {_preview(keyword, 60)}，{len(chosen)} 个名称）："]
+        limit = _as_int(self.config.get("model_list_limit"), 50, 1, 200)
+        for group in chosen[:limit]:
+            count = group["selectable_variants"]
+            if count:
+                state = "可选" + (f"（{count} 个变体）" if count > 1 else "")
+            elif group["upstream_selectable_variants"]:
+                state = "当前配置未放行"
+            else:
+                state = "上游未开放"
+            lines.append(f"• {group['name']} — {state}")
+            aliases = sorted(
+                name for name in group["names"] if name.casefold() != group["name"].casefold()
+            )
+            if aliases:
+                lines.append("  上游名称对照：" + "、".join(aliases))
+            if count and group["name"] not in group["request_names"]:
+                lines.append("  可切换请求名：" + "、".join(sorted(group["request_names"])))
+        if not chosen:
+            lines.append("未找到匹配名称，可尝试 /竞技场模型名称 GPT")
+        if len(chosen) > limit:
+            lines.append(f"……其余 {len(chosen) - limit} 个已省略，请缩小关键词范围。")
+        if not complete:
+            lines.append("当前 Bridge 仅返回可选模型，未开放名称未包含在本表中。")
+        lines.append("可选仅表示允许选择，不代表已验证出图成功；未开放项仅供查看。")
+        lines.append("本表没有切换编号；切换请用 /竞技场切换模型 完整请求名。")
+        return "\n".join(lines)
+
+    @filter.command(
+        "竞技场模型名称",
+        alias={"arena模型名称", "竞技场GPT模型", "竞技场gpt模型", "arenaGPT模型", "arenagpt模型"},
+    )
+    async def list_model_names(
+        self, event: AstrMessageEvent, keyword: GreedyStr = GreedyStr,
+    ):
+        """Read image names and upstream availability flags; default to GPT."""
+        query = str(keyword).strip() if isinstance(keyword, str) else ""
+        try:
+            text = await self._model_name_list_text(query or "GPT")
+        except Exception as exc:
+            yield event.plain_result(f"读取模型名称失败：{_display_error(exc)}")
+            return
+        yield event.plain_result(text)
 
     @filter.command("竞技场画图模型", alias={"arena画图模型", "竞技场模型列表", "arena模型列表"})
     async def list_models(self, event: AstrMessageEvent):
