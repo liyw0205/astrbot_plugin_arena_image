@@ -47,6 +47,7 @@ DEFAULT_RATE_LIMIT_MAX_WAIT = 30.0
 NON_INTERACTIVE_AUTH_CODES = frozenset(
     {
         "recaptcha_mint_failed",
+        "provider_model_unavailable",
     }
 )
 

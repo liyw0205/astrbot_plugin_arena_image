@@ -180,7 +180,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.0",
+    "0.7.1",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -199,7 +199,7 @@ class ArenaImagePlugin(Star):
         self._models_cache: list[dict[str, Any]] = []
         self._models_cached_at = 0.0
         self._models_lock = asyncio.Lock()
-        self._model_health_cache: dict[str, dict[str, float]] = {}
+        self._model_health_cache: dict[str, dict[str, Any]] = {}
         self._model_health_cached_at = 0.0
         self._model_health_lock = asyncio.Lock()
         self._selection_lock = asyncio.Lock()
@@ -307,7 +307,7 @@ class ArenaImagePlugin(Star):
         wait = int(exc.retry_after or 0)
         cooldown = f"{wait} 秒" if wait > 0 else "半分钟到一分钟"
         return (
-            "竞技场上游正在限流（已自动重试仍未通过）。\n"
+            "竞技场上游正在限流。\n"
             f"请等待约 {cooldown} 后再试，连续重试只会继续触发限流。\n"
             "如果一直限流，可用 /竞技场画图模型 或 /竞技场灰测模型 换一个模型。"
         )
@@ -584,7 +584,7 @@ class ArenaImagePlugin(Star):
             self._models_cached_at = time.monotonic()
             return list(models)
 
-    async def _fetch_model_health(self, *, force: bool = False) -> dict[str, dict[str, float]]:
+    async def _fetch_model_health(self, *, force: bool = False) -> dict[str, dict[str, Any]]:
         """Read recent Bridge health statuses; missing models have not been tested."""
         ttl = max(0, _as_int(self.config.get("model_health_cache_seconds"), 30, 0, 3600))
         if not force and self._model_health_cache and time.monotonic() - self._model_health_cached_at < ttl:
@@ -593,7 +593,7 @@ class ArenaImagePlugin(Star):
             if not force and self._model_health_cache and time.monotonic() - self._model_health_cached_at < ttl:
                 return dict(self._model_health_cache)
             payload = await self._client().model_health()
-            health: dict[str, dict[str, float]] = {}
+            health: dict[str, dict[str, Any]] = {}
             for item in payload.get("models", []) if isinstance(payload, dict) else []:
                 if not isinstance(item, dict):
                     continue
@@ -608,6 +608,9 @@ class ArenaImagePlugin(Star):
                     checked_at = 0.0
                 if model_id and status_code > 0:
                     health[model_id] = {"status_code": status_code, "checked_at": checked_at}
+                    for key in ("error_code", "provider_endpoint"):
+                        if item.get(key):
+                            health[model_id][key] = str(item[key])
             self._model_health_cache = health
             self._model_health_cached_at = time.monotonic()
             return dict(health)
@@ -705,6 +708,8 @@ class ArenaImagePlugin(Star):
         if 200 <= status < 300:
             return " ✅"
         age = cls._health_age_text(checked_at)
+        if isinstance(entry, dict) and entry.get("error_code") == "provider_model_unavailable":
+            return f" ⚠{status} 上游端点失效" + (f" {age}" if age else "")
         return f" ⚠{status} {age}" if age else f" ⚠{status}"
 
     @staticmethod
@@ -752,6 +757,7 @@ class ArenaImagePlugin(Star):
         if len(chosen) > limit:
             lines.append(f"……其余 {len(chosen) - limit} 个已省略，可调整 model_list_limit。")
         lines.append("用法：/竞技场切换模型 编号或完整模型名（编号两个列表通用，所以不连号）")
+        lines.append("状态为最近一次请求结果，非实时探活；上游端点名可能与模型显示名不同。")
         lines.append(
             "另一半：/竞技场画图模型（正式模型）"
             if stealth

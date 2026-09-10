@@ -518,6 +518,9 @@ class OpenAIProxyServer:
         elif isinstance(exc, BridgeError) and exc.is_rate_limited:
             status = 429
             code = "rate_limit_exceeded"
+        elif isinstance(exc, BridgeError) and exc.code == "provider_model_unavailable":
+            status = 502
+            code = "provider_model_unavailable"
         elif isinstance(exc, BridgeError) and exc.status_code in {401, 403}:
             status = 502
             code = "upstream_auth_error"

@@ -1143,7 +1143,12 @@ def _load_health(path: Path) -> None:
             except (TypeError, ValueError):
                 continue
             if checked_at > 0 and now - checked_at <= ttl:
-                kept[str(key)] = item
+                record = _normalise_health_record(item)
+                # Session/rate limits are not evidence that a model variant
+                # failed. Older versions put these in the variant blacklist.
+                if section == "variants" and record.get("status_code") in {0, 401, 403, 429}:
+                    continue
+                kept[str(key)] = record
         _HEALTH[section] = kept
 
 
@@ -1179,6 +1184,64 @@ def _moderation_blocked(message: str) -> bool:
     )
 
 
+def _provider_endpoint(message: str) -> str:
+    """Read a provider's endpoint label, never use it to select a public model."""
+    match = re.search(
+        r"\bfor model endpoint ([A-Za-z0-9_.-]{1,160})(?=[:\s]|$)",
+        message or "",
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else ""
+
+
+def _provider_model_missing(message: str) -> bool:
+    return bool(re.search(
+        r"""\b(?:the )?model\s+['"][^'"\r\n]{1,160}['"]\s+does not exist\b""",
+        message or "",
+        re.IGNORECASE,
+    ))
+
+
+def _stream_error_status(status: int | None, message: str) -> int | None:
+    """Separate Arena's HTTP-200 stream envelope from a provider failure."""
+    if status != 200 or not message or _moderation_blocked(message):
+        return status
+    lowered = message.casefold()
+    if "too many requests" in lowered or "rate limit" in lowered:
+        return 429
+    match = re.search(
+        r"\b(?:HTTP(?:\s+status)?|status(?:\s+code)?)\s*[:=]?\s*([45]\d{2})\b"
+        r"|\b([45]\d{2})\s+(?:bad request|unauthorized|forbidden|not found|"
+        r"too many requests|internal server error|bad gateway|service unavailable|gateway timeout)\b",
+        message,
+        re.IGNORECASE,
+    )
+    if match:
+        return int(match.group(1) or match.group(2))
+    return 404 if _provider_model_missing(message) else 502
+
+
+def _normalise_health_record(item: dict[str, Any]) -> dict[str, Any]:
+    """Also repair persisted 0.7.0 records marked 200 despite a stream error."""
+    record = dict(item)
+    try:
+        status = int(record.get("status_code") or 0)
+    except (TypeError, ValueError):
+        return record
+    message = str(record.get("message") or "")
+    effective = _stream_error_status(status, message)
+    if effective != status:
+        record["transport_status_code"] = status
+        record["status_code"] = effective
+        record["error_code"] = "stream_generation_failed"
+    if effective and effective >= 400 and _provider_model_missing(message):
+        record["error_code"] = "provider_model_unavailable"
+        endpoint = _provider_endpoint(message)
+        if endpoint:
+            record["provider_endpoint"] = endpoint
+    return record
+
+
 def _record_health(
     public_name: str,
     model_id: str,
@@ -1186,23 +1249,27 @@ def _record_health(
     message: str = "",
 ) -> None:
     now = time.time()
+    record = _normalise_health_record({
+        "status_code": int(status_code) if status_code is not None else None,
+        "checked_at": now,
+        "message": (message or "")[:1000],
+        "arena_model_id": model_id,
+    })
+    status_code = record.get("status_code")
     healthy = status_code == 200
     if public_name:
         _HEALTH["models"][public_name] = {
+            **record,
             "id": public_name,
-            "status_code": int(status_code) if status_code is not None else None,
-            "checked_at": now,
-            "message": (message or "")[:200],
         }
     if model_id:
         if healthy or _moderation_blocked(message):
             _HEALTH["variants"].pop(model_id, None)
-        else:
+        elif status_code not in {None, 0, 401, 403, 429}:
             _HEALTH["variants"][model_id] = {
+                **record,
                 "id": model_id,
-                "status_code": int(status_code) if status_code is not None else None,
-                "checked_at": now,
-                "message": (message or "")[:200],
+                "public_name": public_name,
             }
     _save_health()
 
@@ -1237,6 +1304,13 @@ def _health_snapshot() -> dict[str, Any]:
                 "status_code": record.get("status_code"),
                 "checked_at": checked_at,
                 "message": record.get("message") or "",
+                **{
+                    key: record[key]
+                    for key in (
+                        "error_code", "provider_endpoint", "arena_model_id", "transport_status_code"
+                    )
+                    if key in record
+                },
             }
         )
     rows.sort(key=lambda item: float(item.get("checked_at") or 0), reverse=True)
@@ -2333,11 +2407,24 @@ class ArenaDirectClient:
             raise BridgeError("提示词和参考图不能同时为空")
 
         attempt = 0
+        variant_retries = 0
         while True:
             try:
                 return await self._generate(clean_model, clean_prompt, image_values)
             except BridgeError as exc:
+                # The public name stays unchanged. Only a missing provider
+                # endpoint warrants one immediate retry on another selectable
+                # variant of that exact name; never guess a renamed model.
+                if exc.code == "provider_model_unavailable" and variant_retries == 0:
+                    rows = self._variants(_MODELS, clean_model)
+                    if any(not _variant_failed_recently(str(row["id"])) for row in rows):
+                        variant_retries += 1
+                        await asyncio.sleep(2.0)
+                        continue
                 if not exc.is_rate_limited or attempt >= self.rate_limit_retries:
+                    raise
+                if (exc.retry_after or 0) > self.rate_limit_max_wait:
+                    # A larger Retry-After is not permission to retry early.
                     raise
                 attempt += 1
                 delay = float(exc.retry_after or 0) or min(15.0, 5.0 * attempt)
@@ -2449,23 +2536,36 @@ class ArenaDirectClient:
         status = int(response.get("status") or 0)
         body = str(response.get("text") or "")
         stream = parse_stream(body)
-        _record_health(public_name, model_id, status, stream.get("error") or "")
         error = str(stream.get("error") or "")
+        if (
+            status == 200 and modality == "image"
+            and not error and not stream.get("images") and not stream.get("text")
+        ):
+            error = "Arena returned an empty image stream"
+            stream["error"] = error
         # A refusal arrives as a normal 200 with an ``a3:`` line.  That is the
         # model answering, so it is reported as text rather than raised as a
         # transport failure -- raising would send the operator to /竞技场验证
         # for something verification cannot fix.
-        if status != 200 or (
+        failed = status != 200 or (
             error and not stream.get("images") and not _moderation_blocked(error)
-        ):
+        )
+        # Successful images win over a warning in the same stream. Conversely,
+        # a3 errors without images must never clear a failed-variant record.
+        _record_health(
+            public_name, model_id, status,
+            error if failed or _moderation_blocked(error) else "",
+        )
+        if failed:
             self._raise_upstream(
-                status=status,
+                status=int(_stream_error_status(status, error) or 0),
                 body=body,
                 stream=stream,
                 headers=response.get("headers") or {},
                 state=state,
                 browser_url=browser_url,
                 public_name=public_name,
+                model_id=model_id,
             )
         return self._openai_payload(public_name, model_id, stream)
 
@@ -2479,6 +2579,7 @@ class ArenaDirectClient:
         state: dict[str, Any],
         browser_url: str,
         public_name: str,
+        model_id: str = "",
     ) -> None:
         """Turn an upstream failure into the error code the UI reacts to."""
         error = str(stream.get("error") or "")
@@ -2498,6 +2599,26 @@ class ArenaDirectClient:
                 code="browser_transport_failed",
                 browser_url=browser_url,
             )
+        if _provider_model_missing(error or body):
+            endpoint = _provider_endpoint(error or body)
+            endpoint_note = (
+                f"Arena 为这个变体调用的上游端点「{endpoint}」已失效（上游 HTTP {status}）。\n"
+                if endpoint else f"Arena 返回这个变体的上游模型不存在（上游 HTTP {status}）。\n"
+            )
+            exc = _err(
+                f"所选模型：{public_name}\n"
+                + endpoint_note
+                + "上游端点名不等于模型显示名，插件没有切换到其他模型。\n"
+                + "已标记失败变体；后续只在同名可选变体中避开它，或等待上游修复。",
+                code="provider_model_unavailable",
+                status_code=status,
+            )
+            exc.payload["error"].update({
+                "requested_model": public_name,
+                "arena_model_id": model_id,
+                "provider_endpoint": endpoint,
+            })
+            raise exc
         if "not available for user selection" in lowered:
             raise _err(
                 f"竞技场不允许手动选择模型「{public_name}」，请换一个模型。",
