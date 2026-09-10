@@ -1991,24 +1991,23 @@ class ArenaDirectClient:
         return [public_model_entry(model) for model in models if self._keep_model(model)]
 
     async def model_name_catalog(self) -> dict[str, Any]:
-        """Read image names for inspection, without exposing them to selection.
-
-        Arena retains hidden rows and explicit display-name mappings. Keep this
-        inventory separate from list_models/_variants so viewing those names
-        never enables a nonselectable model or changes generation routing.
-        """
+        """Read image names using the same visibility rules as the model picker."""
         async with self._page(timeout=90.0) as page:
             models = await self._models(page, refresh=True)
         rows = []
         for model in models:
             public_name = str(model.get("publicName") or "").strip()
-            if not public_name or not model_capability(model, "outputCapabilities", "image"):
+            if (
+                not public_name
+                or not model_capability(model, "outputCapabilities", "image")
+                or not self._keep_model(model)
+            ):
                 continue
             rows.append({
                 "id": public_name,
                 "display_name": str(model.get("displayName") or public_name).strip(),
-                "user_selectable": model.get("userSelectable") is not False,
-                "selectable": self._keep_model(model),
+                "user_selectable": True,
+                "selectable": True,
             })
         return {"models": rows, "complete": True}
 

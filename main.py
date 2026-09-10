@@ -180,7 +180,7 @@ def _first_frame_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
     PLUGIN_NAME,
     "cube-lover",
     "通过 LMArenaBridge 或直连服务器浏览器提供模型列表、模型切换、预设提示词、文生图和图生图",
-    "0.7.2",
+    "0.7.3",
 )
 class ArenaImagePlugin(Star):
     """Commands for the image-capable models exposed by LMArenaBridge."""
@@ -563,6 +563,8 @@ class ArenaImagePlugin(Star):
             for model in raw_models:
                 if not self._model_id(model):
                     continue
+                if any(model.get(key) is False for key in ("userSelectable", "user_selectable", "selectable")):
+                    continue
                 if image_only and not model_is_image_capable(model)[0]:
                     continue
                 models.append(model)
@@ -758,7 +760,7 @@ class ArenaImagePlugin(Star):
             lines.append(f"……其余 {len(chosen) - limit} 个已省略，可调整 model_list_limit。")
         lines.append("用法：/竞技场切换模型 编号或完整模型名（编号两个列表通用，所以不连号）")
         lines.append("状态为最近一次请求结果，非实时探活；上游端点名可能与模型显示名不同。")
-        lines.append("GPT 名称对照（含未开放项）：/竞技场模型名称 GPT")
+        lines.append("GPT 名称查询：/竞技场模型名称 GPT")
         lines.append(
             "另一半：/竞技场画图模型（正式模型）"
             if stealth
@@ -767,7 +769,7 @@ class ArenaImagePlugin(Star):
         return "\n".join(lines)
 
     async def _model_name_list_text(self, keyword: str = "GPT") -> str:
-        """Show a read-only name inventory, separate from the numbered picker."""
+        """Show selectable names without changing the numbered picker or its policy."""
         keyword = keyword.strip() or "GPT"
         client = self._client()
         reader = getattr(client, "model_name_catalog", None)
@@ -776,10 +778,9 @@ class ArenaImagePlugin(Star):
             if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
                 raise BridgeError("后端未返回有效的模型名称列表")
             rows = payload["models"]
-            complete = payload.get("complete") is True
         else:
-            # Older bridge servers expose selectable models only. Do not claim
-            # their filtered list contains the hidden Arena catalog.
+            # Older bridge servers expose selectable models through list_models.
+            # Apply the same filtering as the numbered lists.
             rows = [
                 {
                     "id": self._model_id(model),
@@ -790,10 +791,13 @@ class ArenaImagePlugin(Star):
                 for model in await self._fetch_models(force=True)
                 if model_is_image_capable(model)[0]
             ]
-            complete = False
         groups: dict[str, dict[str, Any]] = {}
         for row in rows:
             if not isinstance(row, dict):
+                continue
+            # Also protect against an older/third-party catalog returning hidden
+            # rows: filter before grouping so their aliases never leak through.
+            if row.get("user_selectable") is not True or row.get("selectable") is not True:
                 continue
             public_name = str(row.get("id") or "").strip()
             display_name = str(row.get("display_name") or public_name).strip()
@@ -801,30 +805,22 @@ class ArenaImagePlugin(Star):
                 continue
             group = groups.setdefault(display_name.casefold(), {
                 "name": display_name, "names": set(), "request_names": set(),
-                "selectable_variants": 0, "upstream_selectable_variants": 0,
+                "selectable_variants": 0,
             })
             group["names"].add(public_name)
-            if row.get("user_selectable") is True:
-                group["upstream_selectable_variants"] += 1
-                if row.get("selectable") is True:
-                    group["selectable_variants"] += 1
-                    group["request_names"].add(public_name)
+            group["selectable_variants"] += 1
+            group["request_names"].add(public_name)
         needle = keyword.casefold()
         chosen = [
             group for group in groups.values()
             if any(needle in name.casefold() for name in (group["name"], *group["names"]))
         ]
-        chosen.sort(key=lambda group: (not bool(group["selectable_variants"]), group["name"].casefold()))
+        chosen.sort(key=lambda group: group["name"].casefold())
         lines = [f"竞技场模型名称（关键词 {_preview(keyword, 60)}，{len(chosen)} 个名称）："]
         limit = _as_int(self.config.get("model_list_limit"), 50, 1, 200)
         for group in chosen[:limit]:
             count = group["selectable_variants"]
-            if count:
-                state = "可选" + (f"（{count} 个变体）" if count > 1 else "")
-            elif group["upstream_selectable_variants"]:
-                state = "当前配置未放行"
-            else:
-                state = "上游未开放"
+            state = "可选" + (f"（{count} 个变体）" if count > 1 else "")
             lines.append(f"• {group['name']} — {state}")
             aliases = sorted(
                 name for name in group["names"] if name.casefold() != group["name"].casefold()
@@ -837,9 +833,7 @@ class ArenaImagePlugin(Star):
             lines.append("未找到匹配名称，可尝试 /竞技场模型名称 GPT")
         if len(chosen) > limit:
             lines.append(f"……其余 {len(chosen) - limit} 个已省略，请缩小关键词范围。")
-        if not complete:
-            lines.append("当前 Bridge 仅返回可选模型，未开放名称未包含在本表中。")
-        lines.append("可选仅表示允许选择，不代表已验证出图成功；未开放项仅供查看。")
+        lines.append("只显示当前可选且配置允许的模型；可选不代表已验证出图成功。")
         lines.append("本表没有切换编号；切换请用 /竞技场切换模型 完整请求名。")
         return "\n".join(lines)
 
@@ -850,7 +844,7 @@ class ArenaImagePlugin(Star):
     async def list_model_names(
         self, event: AstrMessageEvent, keyword: GreedyStr = GreedyStr,
     ):
-        """Read image names and upstream availability flags; default to GPT."""
+        """Read currently selectable image names; default to GPT."""
         query = str(keyword).strip() if isinstance(keyword, str) else ""
         try:
             text = await self._model_name_list_text(query or "GPT")
